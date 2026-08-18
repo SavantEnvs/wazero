@@ -1,0 +1,9 @@
+project: savantenvs/wazero
+target: fuzz_instantiate
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/fuzz_instantiate/testsuite
+cmds:
+  - cmd: /mayhem/fuzz_instantiate
+    libfuzzer: true
+    dictionary: /mayhem/fuzz_instantiate.dict
