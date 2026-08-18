@@ -1,0 +1,55 @@
+//go:build go1.18
+
+// mayhem harness — wazero binary-format decoder + validator.
+//
+// Fuzzes wazero.Runtime.CompileModule: the Wasm binary decoder (section
+// walker, LEB128 varints, name-section/custom-section handling) and the
+// per-instruction validator (type-checking every function body against its
+// declared signature). This is the widest, fastest surface — malformed-module
+// bugs live here.
+//
+// WHY A STAGING DIR (see docs/netnew-worker-prompt.md §6): wazero's repo root
+// mixes `package wazero` and `package wazero_test` files (e.g. runtime.go vs
+// example_test.go), which go-118-fuzz-build's package loader rejects
+// ("found packages wazero and wazero_test"). This harness therefore only
+// needs wazero's PUBLIC API, so mayhem/build.sh copies it into a FRESH,
+// single-file package directory under `_mayhem_harness/decode/` instead of
+// the repo root, and points go-118-fuzz-build at that directory explicitly.
+//
+// NO FILE I/O (§3): bytes come only from the fuzzer; starter seeds (real
+// upstream .wasm fixtures — spec-test suite + testdata/ + examples/) are
+// wired via the Mayhemfile `testsuite:` directive, not read from disk here.
+//
+// BOUNDING (§6b): CompileModule only decodes+validates (no Wasm code
+// executes), so there is no user-controlled loop to hang on. We still run it
+// with the INTERPRETER engine config (fast, deterministic, no AOT-compile
+// overhead per iteration) for consistency with the other two targets, and
+// keep a context timeout as a defensive no-op — decoding does not currently
+// check ctx, but this makes the contract explicit and future-proof if that
+// ever changes upstream.
+package fuzzdecode
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/tetratelabs/wazero"
+)
+
+const decodeTimeout = 500 * time.Millisecond
+
+func FuzzMayhemDecode(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		ctx, cancel := context.WithTimeout(context.Background(), decodeTimeout)
+		defer cancel()
+
+		r := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigInterpreter())
+		defer r.Close(ctx)
+
+		// A bare decode+validate: no imports, no instantiation, no execution.
+		// An error (malformed/invalid module) is an expected outcome, not a
+		// finding.
+		_, _ = r.CompileModule(ctx, data)
+	})
+}
