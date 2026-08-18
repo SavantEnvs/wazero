@@ -1,0 +1,120 @@
+//go:build go1.18
+
+// mayhem harness — wazero instantiate + call, driving an execution engine.
+//
+// This is the deep target: CompileModule, InstantiateModule (bare runtime, no
+// host imports, no WASI — same as fuzz_instantiate), then Call ONE exported
+// function with fixed (all-zero) numeric arguments. This exercises wazero's
+// interpreter execution engine itself: local/stack machine, control flow,
+// numeric/memory/table instructions, calls (including indirect calls through
+// tables), traps, and (via the extended-const / bulk-memory instructions
+// reachable from a function body) more of the runtime than decode/instantiate
+// alone reach.
+//
+// "Fixed arguments": since the fuzzer supplies the WHOLE module (we don't
+// know a function's signature ahead of time), we pick the first exported
+// function whose signature is purely numeric (i32/i64/f32/f64 — no
+// externref/funcref, which we cannot meaningfully synthesize) and call it
+// with an all-zero argument vector of the right arity. That is a fixed,
+// deterministic choice given a module's declared type — not fuzzer-controlled
+// beyond which function happens to be first by declared export order.
+//
+// See harness_decode_test.go.src for why this lives in its own
+// `_mayhem_harness/run/` staging package and carries no file I/O.
+//
+// BOUNDING (§6b — load-bearing, verified empirically before committing: a
+// hand-crafted module with `func $loop (loop (br 0))` was confirmed to make
+// Call return in ~300ms via context deadline exceeded, instead of hanging):
+//   - RuntimeConfig.WithMemoryLimitPages(16): caps linear memory growth to
+//     16 pages (1 MiB), so a called function cannot grow memory into
+//     exhausting host RAM.
+//   - RuntimeConfig.WithCloseOnContextDone(true) + a context.WithTimeout on
+//     BOTH InstantiateModule and Call: wazero's interpreter checks for
+//     context cancellation between instructions, so an untrusted module that
+//     loops forever (`loop; br 0; end`) or recurses without bound is force-
+//     terminated — Call returns a sys.ExitError ("module closed with context
+//     deadline exceeded") instead of hanging the whole libFuzzer campaign.
+//   - The interpreter engine (NewRuntimeConfigInterpreter) is used, not the
+//     optimizing compiler: faster to iterate, deterministic, and avoids
+//     architecture-specific AOT-compile behavior differences.
+//   - The default "_start" auto-invocation is cleared
+//     (ModuleConfig.WithStartFunctions()) so there is exactly ONE bounded
+//     call per iteration — the explicit export call below — rather than two
+//     separately-timed executions.
+//
+// A bare runtime with NO host imports, NO WASI, NO filesystem/network access.
+package fuzzrun
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
+)
+
+const (
+	callTimeout      = 300 * time.Millisecond
+	memoryLimitPages = 16 // 16 * 64KiB = 1 MiB max linear memory
+)
+
+func FuzzMayhemRun(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		ctx := context.Background()
+
+		cfg := wazero.NewRuntimeConfigInterpreter().
+			WithCloseOnContextDone(true).
+			WithMemoryLimitPages(memoryLimitPages)
+		r := wazero.NewRuntimeWithConfig(ctx, cfg)
+		defer r.Close(ctx)
+
+		compiled, err := r.CompileModule(ctx, data)
+		if err != nil {
+			return
+		}
+
+		modCfg := wazero.NewModuleConfig().WithStartFunctions() // no auto "_start"
+
+		instCtx, cancel := context.WithTimeout(ctx, callTimeout)
+		mod, err := r.InstantiateModule(instCtx, compiled, modCfg)
+		cancel()
+		if err != nil {
+			return
+		}
+		defer mod.Close(ctx)
+
+		// Pick the first purely-numeric-signature export (by declared export
+		// order) and call it once with an all-zero fixed argument vector.
+		var fnName string
+		var arity int
+	pick:
+		for name, def := range compiled.ExportedFunctions() {
+			if def.GoFunction() != nil {
+				continue // host-defined re-export, not a wasm function
+			}
+			for _, p := range def.ParamTypes() {
+				switch p {
+				case api.ValueTypeI32, api.ValueTypeI64, api.ValueTypeF32, api.ValueTypeF64:
+				default:
+					continue pick // externref/funcref/v128 param: skip
+				}
+			}
+			fnName, arity = name, len(def.ParamTypes())
+			break
+		}
+		if fnName == "" {
+			return // no callable numeric export in this module
+		}
+
+		fn := mod.ExportedFunction(fnName)
+		if fn == nil {
+			return
+		}
+		args := make([]uint64, arity) // fixed: all-zero arguments
+
+		callCtx, cancelCall := context.WithTimeout(ctx, callTimeout)
+		defer cancelCall()
+		_, _ = fn.Call(callCtx, args...)
+	})
+}

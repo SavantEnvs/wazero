@@ -1,0 +1,84 @@
+//go:build go1.18
+
+// mayhem harness — wazero module instantiation (no host imports, no WASI).
+//
+// Fuzzes wazero.Runtime.CompileModule + InstantiateModule with a bare
+// runtime: this adds the instantiation path over fuzz_decode — memory/table/
+// global initialisation, and element/data segment application (including the
+// extended-const proposal's constant-expression evaluator) — without yet
+// calling into any exported function (that is fuzz_run's job).
+//
+// See harness_decode_test.go.src for why this lives in its own
+// `_mayhem_harness/instantiate/` staging package (wazero's repo root mixes
+// `package wazero` and `package wazero_test` files, which go-118-fuzz-build's
+// package loader rejects) and why there is no file I/O here (seeds come from
+// the Mayhemfile `testsuite:` directive).
+//
+// BOUNDING (§6b — load-bearing, verified empirically before committing):
+//   - RuntimeConfig.WithMemoryLimitPages(16): caps linear memory growth to
+//     16 pages (1 MiB) for any module instantiated under this runtime, so an
+//     attacker-declared huge `memory` section or a memory.grow loop cannot
+//     exhaust host memory.
+//   - RuntimeConfig.WithCloseOnContextDone(true) + a context.WithTimeout on
+//     the InstantiateModule call: instantiation runs active element/data
+//     segment offset expressions and (under the extended-const proposal) can
+//     involve nontrivial constant-expression evaluation; the timeout+close
+//     combination guarantees the call returns even if that path were ever
+//     slow, instead of stalling the whole fuzz campaign.
+//   - RuntimeConfig.WithMemoryCapacityFromMax is left at its default (off) so
+//     a large *declared* max does not itself pre-allocate memory.
+//   - The interpreter engine (NewRuntimeConfigInterpreter) is used for speed
+//     and determinism, matching fuzz_decode/fuzz_run.
+//   - The default "_start" auto-invocation is explicitly cleared
+//     (ModuleConfig.WithStartFunctions() with no arguments) so this target
+//     measures instantiation alone; fuzz_run drives an explicit, separately
+//     bounded call into an export.
+//
+// A bare runtime with NO host imports, NO WASI, NO filesystem/network access:
+// any module that imports a host module (e.g. "wasi_snapshot_preview1") will
+// simply fail to instantiate (a normal, expected outcome), never actually
+// reach real I/O.
+package fuzzinstantiate
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/tetratelabs/wazero"
+)
+
+const (
+	instantiateTimeout = 300 * time.Millisecond
+	memoryLimitPages   = 16 // 16 * 64KiB = 1 MiB max linear memory
+)
+
+func FuzzMayhemInstantiate(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		ctx := context.Background()
+
+		cfg := wazero.NewRuntimeConfigInterpreter().
+			WithCloseOnContextDone(true).
+			WithMemoryLimitPages(memoryLimitPages)
+		r := wazero.NewRuntimeWithConfig(ctx, cfg)
+		defer r.Close(ctx)
+
+		compiled, err := r.CompileModule(ctx, data)
+		if err != nil {
+			// Malformed/invalid input: expected, not a finding.
+			return
+		}
+
+		modCfg := wazero.NewModuleConfig().WithStartFunctions() // no auto "_start"
+
+		instCtx, cancel := context.WithTimeout(ctx, instantiateTimeout)
+		defer cancel()
+		mod, err := r.InstantiateModule(instCtx, compiled, modCfg)
+		if err != nil {
+			// Missing import, out-of-bounds segment, trapping start
+			// expression, etc: all expected outcomes for adversarial input.
+			return
+		}
+		defer mod.Close(ctx)
+	})
+}
